@@ -1,0 +1,1031 @@
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, onAuthStateChanged, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut } from 'firebase/auth';
+import { getFirestore, collection, doc, onSnapshot, addDoc, deleteDoc, updateDoc, setDoc, query, where, getDocs, writeBatch } from 'firebase/firestore';
+import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer, LineChart, Line } from 'recharts';
+import { Plus, Trash2, Edit, TrendingUp, TrendingDown, Target, Wallet, LogOut, DollarSign, Calendar, Tag, Info, X, Globe, BarChart2, LineChart as LineChartIcon, Sun, Moon, Sparkles, Mail, KeyRound } from 'lucide-react';
+
+// --- Firebase Configuration ---
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_AUTH_DOMAIN",
+  projectId: "YOUR_PROJECT_ID",
+  storageBucket: "YOUR_STORAGE_BUCKET",
+  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+  appId: "YOUR_APP_ID"
+};
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-personal-finance-app';
+
+// --- Localization & Currency Data ---
+const currencies = [
+    { code: 'PKR', symbol: 'Rs', lang: 'ur-PK' },
+    { code: 'USD', symbol: '$', lang: 'en-US' },
+    { code: 'INR', symbol: '₹', lang: 'hi-IN' },
+    { code: 'EUR', symbol: '€', lang: 'en-US' }, 
+];
+
+// --- Utility Functions ---
+const formatCurrency = (amount, currency) => {
+    return `${currency.symbol} ${Number(amount).toLocaleString()}`;
+};
+
+// --- Gemini API Call Function ---
+const callGeminiAPI = async (prompt, isJson = false) => {
+    const apiKey = ""; // Provided by the environment
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+    const payload = {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+    };
+    
+    if (isJson) {
+        payload.generationConfig = {
+            responseMimeType: "application/json",
+            responseSchema: {
+                type: "ARRAY",
+                items: {
+                    type: "OBJECT",
+                    properties: {
+                        title: { type: "STRING" },
+                        message: { type: "STRING" },
+                        type: { type: "STRING", enum: ["success", "warning", "info"] }
+                    },
+                    required: ["title", "message", "type"]
+                }
+            }
+        };
+    }
+
+    try {
+        const response = await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            throw new Error(`API call failed with status: ${response.status}`);
+        }
+
+        const result = await response.json();
+        if (result.candidates && result.candidates.length > 0 &&
+            result.candidates[0].content && result.candidates[0].content.parts &&
+            result.candidates[0].content.parts.length > 0) {
+            const text = result.candidates[0].content.parts[0].text;
+            return text;
+        } else {
+            console.error("Unexpected API response structure:", result);
+            return null;
+        }
+    } catch (error) {
+        console.error("Error calling Gemini API:", error);
+        return null;
+    }
+};
+
+
+// --- Custom Hooks for Animations ---
+const useAnimateOnScroll = (options) => {
+    const ref = useRef(null);
+    const [isVisible, setIsVisible] = useState(false);
+
+    useEffect(() => {
+        const observer = new IntersectionObserver(([entry]) => {
+            if (entry.isIntersecting) {
+                setIsVisible(true);
+                observer.unobserve(entry.target);
+            }
+        }, options);
+
+        const currentRef = ref.current;
+        if (currentRef) {
+            observer.observe(currentRef);
+        }
+
+        return () => {
+            if (currentRef) {
+                observer.unobserve(currentRef);
+            }
+        };
+    }, [ref, options]);
+
+    return [ref, isVisible];
+};
+
+const useCountUpAnimation = (endValue, duration = 1500) => {
+    const [count, setCount] = useState(0);
+    const animationFrameRef = useRef();
+    const startTimeRef = useRef();
+
+    const animate = useCallback((timestamp) => {
+        if (!startTimeRef.current) {
+            startTimeRef.current = timestamp;
+        }
+
+        const progress = timestamp - startTimeRef.current;
+        const percentage = Math.min(progress / duration, 1);
+        const currentCount = Math.floor(percentage * endValue);
+
+        setCount(currentCount);
+
+        if (progress < duration) {
+            animationFrameRef.current = requestAnimationFrame(animate);
+        } else {
+            setCount(endValue);
+        }
+    }, [endValue, duration]);
+
+    useEffect(() => {
+        startTimeRef.current = null;
+        animationFrameRef.current = requestAnimationFrame(animate);
+        
+        return () => cancelAnimationFrame(animationFrameRef.current);
+    }, [endValue, animate]);
+
+    return count;
+};
+
+
+// --- Main App Component ---
+export default function App() {
+    // Firebase State
+    const [auth, setAuth] = useState(null);
+    const [db, setDb] = useState(null);
+    const [user, setUser] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [isSeeding, setIsSeeding] = useState(false); // New state for seeding
+    const [authView, setAuthView] = useState('login'); 
+
+    // App State
+    const [view, setView] = useState('dashboard');
+    const [transactions, setTransactions] = useState([]);
+    const [budgets, setBudgets] = useState([]);
+    const [goals, setGoals] = useState([]);
+    const [modal, setModal] = useState({ isOpen: false, type: '', data: null });
+    const [selectedCurrency, setSelectedCurrency] = useState(currencies[0]);
+    const [theme, setTheme] = useState('dark');
+
+    // --- Theme Management ---
+    useEffect(() => {
+        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        setTheme(prefersDark ? 'dark' : 'light');
+    }, []);
+
+    useEffect(() => {
+        document.documentElement.setAttribute('data-theme', theme);
+    }, [theme]);
+
+    // --- Firebase Initialization and Auth ---
+    useEffect(() => {
+        const app = initializeApp(firebaseConfig);
+        const authInstance = getAuth(app);
+        const dbInstance = getFirestore(app);
+        setAuth(authInstance);
+        setDb(dbInstance);
+
+        const seedInitialData = async (uid) => {
+            if (!dbInstance) return;
+            setIsSeeding(true);
+            try {
+                const batch = writeBatch(dbInstance);
+                const sampleTransactions = [
+                    { amount: 50000, type: 'income', category: 'Salary', date: new Date().toISOString().split('T')[0], description: 'Monthly Salary' },
+                    { amount: 2500, type: 'expense', category: 'Groceries', date: new Date().toISOString().split('T')[0], description: 'Weekly Groceries' },
+                ];
+                sampleTransactions.forEach(t => {
+                    const docRef = doc(collection(dbInstance, `artifacts/${appId}/users/${uid}/transactions`));
+                    batch.set(docRef, t);
+                });
+                await batch.commit();
+            } catch (error) {
+                console.error("Error creating initial data for new user:", error);
+            } finally {
+                setIsSeeding(false);
+            }
+        };
+
+        const unsubscribe = onAuthStateChanged(authInstance, (currentUser) => {
+            if (currentUser) {
+                const creationTime = new Date(currentUser.metadata.creationTime).getTime();
+                const lastSignInTime = new Date(currentUser.metadata.lastSignInTime).getTime();
+                const isNewUser = Math.abs(creationTime - lastSignInTime) < 1000;
+
+                setUser(currentUser);
+                setUserId(currentUser.uid);
+
+                if (isNewUser) {
+                    seedInitialData(currentUser.uid);
+                }
+            } else {
+                setUser(null);
+                setUserId(null);
+            }
+            setIsAuthReady(true);
+        });
+
+        return () => unsubscribe();
+    }, []);
+    
+    // --- Data Fetching from Firestore ---
+    useEffect(() => {
+        if (isAuthReady && userId && db) {
+            const collections = ['transactions', 'budgets', 'goals'];
+            const unsubscribers = collections.map(col => {
+                const q = query(collection(db, `artifacts/${appId}/users/${userId}/${col}`));
+                return onSnapshot(q, (snapshot) => {
+                    const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    if (col === 'transactions') setTransactions(data);
+                    if (col === 'budgets') setBudgets(data);
+                    if (col === 'goals') setGoals(data);
+                }, (error) => {
+                    console.error(`Error fetching ${col}:`, error);
+                });
+            });
+            
+            return () => unsubscribers.forEach(unsub => unsub());
+        }
+    }, [isAuthReady, userId, db]);
+
+
+    // --- Data Calculations ---
+    const financialSummary = useMemo(() => {
+        const income = transactions.filter(t => t.type === 'income').reduce((acc, t) => acc + Number(t.amount), 0);
+        const expense = transactions.filter(t => t.type === 'expense').reduce((acc, t) => acc + Number(t.amount), 0);
+        const balance = income - expense;
+        const expenseByCategory = transactions
+            .filter(t => t.type === 'expense')
+            .reduce((acc, t) => {
+                acc[t.category] = (acc[t.category] || 0) + Number(t.amount);
+                return acc;
+            }, {});
+        return { income, expense, balance, expenseByCategory };
+    }, [transactions]);
+
+    // --- Modal Handling ---
+    const openModal = (type, data = null) => setModal({ isOpen: true, type, data });
+    const closeModal = () => setModal({ isOpen: false, type: '', data: null });
+
+    // --- CRUD Operations ---
+    const handleAdd = async (collectionName, data) => {
+        if (!db || !userId) return;
+        try {
+            await addDoc(collection(db, `artifacts/${appId}/users/${userId}/${collectionName}`), data);
+            closeModal();
+        } catch (error) {
+            console.error("Error adding document: ", error);
+        }
+    };
+
+    const handleUpdate = async (collectionName, id, data) => {
+        if (!db || !userId) return;
+        try {
+            await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/${collectionName}`, id), data);
+            closeModal();
+        } catch (error) {
+            console.error("Error updating document: ", error);
+        }
+    };
+
+    const handleDelete = async (collectionName, id) => {
+        if (!db || !userId) return;
+        if (window.confirm("Kya aap waqai is item ko delete karna chahte hain?")) {
+            try {
+                await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/${collectionName}`, id));
+            } catch (error) {
+                console.error("Error deleting document: ", error);
+            }
+        }
+    };
+    
+    // --- Authentication Handlers ---
+    const handleSignUp = async (email, password) => {
+        if (!auth) return;
+        try {
+            await createUserWithEmailAndPassword(auth, email, password);
+        } catch (error) {
+            alert(error.message);
+        }
+    };
+
+    const handleLogin = async (email, password) => {
+        if (!auth) return;
+        try {
+            await signInWithEmailAndPassword(auth, email, password);
+        } catch (error) {
+            alert(error.message);
+        }
+    };
+
+    const handleLogout = async () => {
+        if (!auth) return;
+        await signOut(auth);
+    };
+
+    if (!isAuthReady) {
+        return <div className="h-screen w-full flex items-center justify-center bg-gray-900 text-white"><div className="animate-spin rounded-full h-32 w-32 border-t-2 border-b-2 border-blue-500"></div></div>;
+    }
+
+    return (
+        <>
+        <style>{`
+            :root, [data-theme='light'] {
+                --background: #f4f7f9;
+                --background-card: #ffffff;
+                --background-nav: #ffffff;
+                --background-hover: #e9ecef;
+                --background-secondary: #e9ecef;
+                --text-primary: #212529;
+                --text-secondary: #6c757d;
+                --border-color: #dee2e6;
+                --accent-color: #007bff;
+                --accent-color-hover: #0069d9;
+                --shadow-color: rgba(0, 0, 0, 0.1);
+            }
+            [data-theme='dark'] {
+                --background: linear-gradient(135deg, #0f172a, #1e293b);
+                --background-card: rgba(30, 41, 59, 0.6);
+                --background-nav: #1e293b;
+                --background-hover: #334155;
+                --background-secondary: #334155;
+                --text-primary: #f8fafc;
+                --text-secondary: #94a3b8;
+                --border-color: #334155;
+                --accent-color: #3b82f6;
+                --accent-color-hover: #2563eb;
+                --shadow-color: rgba(0, 0, 0, 0.3);
+            }
+            @keyframes fadeInUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+            @keyframes scaleIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+            .animate-fadeInUp { animation: fadeInUp 0.5s ease-out forwards; }
+            .animate-scaleIn { animation: scaleIn 0.3s ease-out forwards; }
+            .invisible-for-animation { opacity: 0; }
+        `}</style>
+        <div className="flex h-screen bg-[var(--background)] text-[var(--text-primary)] font-sans transition-colors duration-300">
+            {!user ? (
+                authView === 'login' ? 
+                <Login setAuthView={setAuthView} handleLogin={handleLogin} /> : 
+                <SignUp setAuthView={setAuthView} handleSignUp={handleSignUp} />
+            ) : isSeeding ? (
+                <SetupScreen />
+            ) : (
+                <>
+                    <Navbar view={view} setView={setView} theme={theme} setTheme={setTheme} handleLogout={handleLogout} />
+                    <main className="flex-1 p-4 sm:p-6 lg:p-8 overflow-y-auto">
+                        <Header 
+                            openModal={openModal} 
+                            selectedCurrency={selectedCurrency} 
+                            setSelectedCurrency={setSelectedCurrency} 
+                        />
+                        <div className="mt-8">
+                            {view === 'dashboard' && <Dashboard financialSummary={financialSummary} budgets={budgets} goals={goals} transactions={transactions} currency={selectedCurrency} />}
+                            {view === 'transactions' && <TransactionsList transactions={transactions} openModal={openModal} handleDelete={handleDelete} currency={selectedCurrency} />}
+                            {view === 'budgets' && <BudgetsList budgets={budgets} openModal={openModal} handleDelete={handleDelete} expenseByCategory={financialSummary.expenseByCategory} currency={selectedCurrency} />}
+                            {view === 'goals' && <GoalsList goals={goals} openModal={openModal} handleDelete={handleDelete} currency={selectedCurrency} />}
+                        </div>
+                    </main>
+                    {modal.isOpen && <Modal modal={modal} closeModal={closeModal} handleAdd={handleAdd} handleUpdate={handleUpdate} currency={selectedCurrency} />}
+                </>
+            )}
+        </div>
+        </>
+    );
+}
+
+// --- Authentication Components ---
+const AuthFormContainer = ({ title, children }) => (
+    <div className="w-full h-full flex flex-col items-center justify-center p-4 animate-fadeInUp">
+        <div className="w-full max-w-sm bg-[var(--background-card)] p-8 rounded-2xl shadow-2xl border border-[var(--border-color)]">
+            <div className="flex justify-center mb-6">
+                <TrendingUp className="text-[var(--accent-color)] h-12 w-12" />
+            </div>
+            <h2 className="text-2xl font-bold text-center mb-6 text-[var(--text-primary)]">{title}</h2>
+            {children}
+        </div>
+    </div>
+);
+
+const Login = ({ setAuthView, handleLogin }) => {
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+
+    const onSubmit = (e) => {
+        e.preventDefault();
+        handleLogin(email, password);
+    };
+
+    return (
+        <AuthFormContainer title="Login to Your Account">
+            <form onSubmit={onSubmit}>
+                <div className="relative mb-4">
+                    <Mail className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-secondary)]" size={20} />
+                    <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full p-2 pl-10 bg-[var(--background-secondary)] rounded border border-[var(--border-color)] focus:ring-2 focus:ring-[var(--accent-color)] outline-none" required />
+                </div>
+                <div className="relative mb-6">
+                    <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-secondary)]" size={20} />
+                    <input type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} className="w-full p-2 pl-10 bg-[var(--background-secondary)] rounded border border-[var(--border-color)] focus:ring-2 focus:ring-[var(--accent-color)] outline-none" required />
+                </div>
+                <button type="submit" className="w-full bg-[var(--accent-color)] hover:bg-[var(--accent-color-hover)] text-white font-bold py-3 rounded-lg transition-all transform hover:scale-105">Login</button>
+            </form>
+            <p className="text-center text-sm mt-6 text-[var(--text-secondary)]">
+                Don't have an account? <span onClick={() => setAuthView('signup')} className="font-semibold text-[var(--accent-color)] cursor-pointer hover:underline">Sign up</span>
+            </p>
+        </AuthFormContainer>
+    );
+};
+
+const SignUp = ({ setAuthView, handleSignUp }) => {
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+
+    const onSubmit = (e) => {
+        e.preventDefault();
+        handleSignUp(email, password);
+    };
+
+    return (
+        <AuthFormContainer title="Create a New Account">
+            <form onSubmit={onSubmit}>
+                <div className="relative mb-4">
+                    <Mail className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-secondary)]" size={20} />
+                    <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full p-2 pl-10 bg-[var(--background-secondary)] rounded border border-[var(--border-color)] focus:ring-2 focus:ring-[var(--accent-color)] outline-none" required />
+                </div>
+                <div className="relative mb-6">
+                    <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-secondary)]" size={20} />
+                    <input type="password" placeholder="Password (min. 6 characters)" value={password} onChange={(e) => setPassword(e.target.value)} className="w-full p-2 pl-10 bg-[var(--background-secondary)] rounded border border-[var(--border-color)] focus:ring-2 focus:ring-[var(--accent-color)] outline-none" required />
+                </div>
+                <button type="submit" className="w-full bg-[var(--accent-color)] hover:bg-[var(--accent-color-hover)] text-white font-bold py-3 rounded-lg transition-all transform hover:scale-105">Sign Up</button>
+            </form>
+            <p className="text-center text-sm mt-6 text-[var(--text-secondary)]">
+                Already have an account? <span onClick={() => setAuthView('login')} className="font-semibold text-[var(--accent-color)] cursor-pointer hover:underline">Login</span>
+            </p>
+        </AuthFormContainer>
+    );
+};
+
+const SetupScreen = () => (
+    <div className="w-full h-full flex flex-col items-center justify-center p-4 animate-fadeInUp">
+        <div className="flex flex-col items-center">
+            <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-[var(--accent-color)] mb-4"></div>
+            <h2 className="text-2xl font-bold text-[var(--text-primary)]">Setting up your account...</h2>
+            <p className="text-[var(--text-secondary)]">Please wait while we prepare your dashboard.</p>
+        </div>
+    </div>
+);
+
+
+// --- Main App Components ---
+
+const Navbar = ({ view, setView, theme, setTheme, handleLogout }) => {
+    const navItems = [
+        { id: 'dashboard', label: 'Dashboard', icon: Wallet },
+        { id: 'transactions', label: 'Transactions', icon: DollarSign },
+        { id: 'budgets', label: 'Budgets', icon: Tag },
+        { id: 'goals', label: 'Goals', icon: Target },
+    ];
+    
+    const toggleTheme = () => {
+        setTheme(theme === 'light' ? 'dark' : 'light');
+    };
+
+    return (
+        <nav className="w-16 md:w-64 bg-[var(--background-nav)] p-2 md:p-4 flex flex-col justify-between shadow-lg transition-colors duration-300">
+            <div>
+                <div className="flex items-center mb-10 p-2">
+                    <TrendingUp className="text-[var(--accent-color)] h-8 w-8" />
+                    <h1 className="text-xl font-bold ml-2 hidden md:block">Finance App</h1>
+                </div>
+                <ul>
+                    {navItems.map(item => (
+                        <li key={item.id}
+                            onClick={() => setView(item.id)}
+                            className={`flex items-center p-3 my-2 rounded-lg cursor-pointer transition-all duration-300 transform hover:-translate-y-1 ${view === item.id ? 'bg-[var(--accent-color)] text-white shadow-md' : 'hover:bg-[var(--background-hover)]'}`}>
+                            <item.icon className="h-5 w-5" />
+                            <span className="ml-4 hidden md:block">{item.label}</span>
+                        </li>
+                    ))}
+                </ul>
+            </div>
+            <div className="p-2">
+                <div onClick={toggleTheme} className="flex items-center p-3 my-2 rounded-lg cursor-pointer transition-all hover:bg-[var(--background-hover)]">
+                    {theme === 'light' ? <Moon className="h-5 w-5" /> : <Sun className="h-5 w-5" />}
+                    <span className="ml-4 hidden md:block">Toggle Theme</span>
+                </div>
+                 <div onClick={handleLogout} className="flex items-center p-3 my-2 rounded-lg cursor-pointer transition-all hover:bg-[var(--background-hover)]">
+                    <LogOut className="h-5 w-5" />
+                    <span className="ml-4 hidden md:block">Logout</span>
+                </div>
+            </div>
+        </nav>
+    );
+};
+
+const Header = ({ openModal, selectedCurrency, setSelectedCurrency }) => (
+    <div className="flex justify-between items-center">
+        <h2 className="text-3xl font-bold text-[var(--text-primary)]">Welcome Back!</h2>
+        <div className="flex items-center space-x-4">
+            <CurrencySelector selectedCurrency={selectedCurrency} setSelectedCurrency={setSelectedCurrency} />
+            <button onClick={() => openModal('transaction')} className="bg-[var(--accent-color)] hover:bg-[var(--accent-color-hover)] text-white font-bold py-2 px-4 rounded-lg flex items-center transition-transform transform hover:scale-105 shadow-lg">
+                <Plus className="h-5 w-5 mr-2" /> Add Transaction
+            </button>
+        </div>
+    </div>
+);
+
+const CurrencySelector = ({ selectedCurrency, setSelectedCurrency }) => {
+    const [isOpen, setIsOpen] = useState(false);
+    const ref = useRef(null);
+
+    useEffect(() => {
+        const handleClickOutside = (event) => {
+            if (ref.current && !ref.current.contains(event.target)) {
+                setIsOpen(false);
+            }
+        };
+        document.addEventListener("mousedown", handleClickOutside);
+        return () => document.removeEventListener("mousedown", handleClickOutside);
+    }, [ref]);
+
+    return (
+        <div className="relative" ref={ref}>
+            <button onClick={() => setIsOpen(!isOpen)} className="flex items-center space-x-2 bg-[var(--background-secondary)] px-3 py-2 rounded-lg hover:bg-[var(--background-hover)] transition-colors">
+                <Globe size={20} className="text-[var(--text-secondary)]" />
+                <span className="font-semibold">{selectedCurrency.code}</span>
+            </button>
+            {isOpen && (
+                <div className="absolute right-0 mt-2 w-32 bg-[var(--background-card)] border border-[var(--border-color)] rounded-lg shadow-xl z-10 animate-scaleIn">
+                    {currencies.map(currency => (
+                        <div key={currency.code} onClick={() => { setSelectedCurrency(currency); setIsOpen(false); }}
+                            className="px-4 py-2 hover:bg-[var(--background-hover)] cursor-pointer rounded-lg">
+                            {currency.code} ({currency.symbol})
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+};
+
+const CustomAnimatedLegend = (props) => {
+    const { payload } = props;
+    return (
+        <ul className="flex justify-center flex-wrap gap-x-4 gap-y-2 mt-4">
+            {payload.map((entry, index) => (
+                <li key={`item-${index}`} className="flex items-center text-sm text-[var(--text-secondary)]" style={{ animation: `fadeInUp 0.5s ease-out ${0.5 + index * 0.1}s forwards`, opacity: 0 }}>
+                    <span className="w-3 h-3 rounded-full mr-2" style={{ backgroundColor: entry.color }} />
+                    {entry.value}
+                </li>
+            ))}
+        </ul>
+    );
+};
+
+const Dashboard = ({ financialSummary, budgets, goals, transactions, currency }) => {
+    const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8'];
+    const expenseData = Object.entries(financialSummary.expenseByCategory).map(([name, value]) => ({ name, value }));
+
+    const sortedTransactions = useMemo(() => 
+        [...transactions].sort((a, b) => new Date(b.date) - new Date(a.date)),
+        [transactions]
+    );
+    
+    const [chartView, setChartView] = useState('line');
+
+    const monthlyData = useMemo(() => {
+        const data = {};
+        transactions.forEach(t => {
+            const month = t.date.substring(0, 7);
+            if (!data[month]) {
+                data[month] = { month, income: 0, expense: 0 };
+            }
+            if (t.type === 'income') {
+                data[month].income += t.amount;
+            } else {
+                data[month].expense += t.amount;
+            }
+        });
+        return Object.values(data).sort((a, b) => a.month.localeCompare(b.month));
+    }, [transactions]);
+
+    const [ref1, isVisible1] = useAnimateOnScroll({ threshold: 0.1 });
+    const [ref2, isVisible2] = useAnimateOnScroll({ threshold: 0.1 });
+    const [ref3, isVisible3] = useAnimateOnScroll({ threshold: 0.1 });
+    const [ref4, isVisible4] = useAnimateOnScroll({ threshold: 0.1 });
+    const [ref5, isVisible5] = useAnimateOnScroll({ threshold: 0.1 });
+
+    return (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-2 space-y-6">
+                <div ref={ref1} className={`grid grid-cols-1 md:grid-cols-3 gap-6 invisible-for-animation ${isVisible1 ? 'animate-fadeInUp' : ''}`}>
+                    <InfoCard title="Total Income" amount={financialSummary.income} icon={TrendingUp} color="text-green-400" currency={currency} isVisible={isVisible1} />
+                    <InfoCard title="Total Expense" amount={financialSummary.expense} icon={TrendingDown} color="text-red-400" currency={currency} isVisible={isVisible1} />
+                    <InfoCard title="Balance" amount={financialSummary.balance} icon={Wallet} color={financialSummary.balance >= 0 ? "text-blue-400" : "text-yellow-400"} currency={currency} isVisible={isVisible1} />
+                </div>
+                <div ref={ref2} className={`bg-[var(--background-card)] backdrop-blur-sm p-6 rounded-xl shadow-lg border border-[var(--border-color)] invisible-for-animation ${isVisible2 ? 'animate-fadeInUp' : ''}`}>
+                    <div className="flex justify-between items-center mb-4">
+                        <h3 className="text-xl font-semibold">Income vs Expense</h3>
+                        <div className="flex items-center bg-[var(--background-secondary)] rounded-lg p-1">
+                            <button onClick={() => setChartView('line')} className={`p-1 px-3 rounded-md transition-colors ${chartView === 'line' ? 'bg-[var(--accent-color)] text-white' : 'hover:bg-[var(--background-hover)]'}`}><LineChartIcon size={20}/></button>
+                            <button onClick={() => setChartView('bar')} className={`p-1 px-3 rounded-md transition-colors ${chartView === 'bar' ? 'bg-[var(--accent-color)] text-white' : 'hover:bg-[var(--background-hover)]'}`}><BarChart2 size={20}/></button>
+                        </div>
+                    </div>
+                    <ResponsiveContainer width="100%" height={300}>
+                        {chartView === 'line' ? (
+                            <LineChart data={monthlyData}>
+                                <XAxis dataKey="month" stroke="var(--text-secondary)" />
+                                <YAxis stroke="var(--text-secondary)" tickFormatter={(value) => new Intl.NumberFormat('en-US', { notation: 'compact', compactDisplay: 'short' }).format(value)} />
+                                <Tooltip contentStyle={{ backgroundColor: 'var(--background-card)', border: '1px solid var(--border-color)' }} formatter={(value) => formatCurrency(value, currency)} />
+                                <Legend />
+                                <Line type="monotone" dataKey="income" stroke="#22c55e" strokeWidth={2} dot={false} isAnimationActive={true} animationDuration={1000} />
+                                <Line type="monotone" dataKey="expense" stroke="#ef4444" strokeWidth={2} dot={false} isAnimationActive={true} animationDuration={1000} animationBegin={200} />
+                            </LineChart>
+                        ) : (
+                            <BarChart data={monthlyData}>
+                                <XAxis dataKey="month" stroke="var(--text-secondary)" />
+                                <YAxis stroke="var(--text-secondary)" tickFormatter={(value) => new Intl.NumberFormat('en-US', { notation: 'compact', compactDisplay: 'short' }).format(value)} />
+                                <Tooltip contentStyle={{ backgroundColor: 'var(--background-card)', border: '1px solid var(--border-color)' }} formatter={(value) => formatCurrency(value, currency)} />
+                                <Legend />
+                                <Bar dataKey="income" fill="#22c55e" isAnimationActive={true} animationDuration={1000} />
+                                <Bar dataKey="expense" fill="#ef4444" isAnimationActive={true} animationDuration={1000} />
+                            </BarChart>
+                        )}
+                    </ResponsiveContainer>
+                </div>
+                <div ref={ref3} className={`bg-[var(--background-card)] backdrop-blur-sm p-6 rounded-xl shadow-lg border border-[var(--border-color)] invisible-for-animation ${isVisible3 ? 'animate-fadeInUp' : ''}`}>
+                    <h3 className="text-xl font-semibold mb-4">Recent Transactions</h3>
+                    <div className="space-y-3">
+                        {sortedTransactions.slice(0, 5).map((t, index) => (
+                            <div key={t.id} className="flex justify-between items-center bg-[var(--background-secondary)] p-3 rounded-lg" style={{ animation: `fadeInUp 0.5s ease-out ${index * 0.1}s forwards`, opacity: 0 }}>
+                                <div className="flex items-center">
+                                    <div className={`p-2 rounded-full mr-3 ${t.type === 'income' ? 'bg-green-500/20' : 'bg-red-500/20'}`}>
+                                        {t.type === 'income' ? <TrendingUp className="text-green-400 h-5 w-5" /> : <TrendingDown className="text-red-400 h-5 w-5" />}
+                                    </div>
+                                    <div>
+                                        <p className="font-medium">{t.description}</p>
+                                        <p className="text-sm text-[var(--text-secondary)]">{t.category} - {new Date(t.date).toLocaleDateString()}</p>
+                                    </div>
+                                </div>
+                                <p className={`font-semibold ${t.type === 'income' ? 'text-green-400' : 'text-red-400'}`}>
+                                    {t.type === 'income' ? '+' : '-'} {formatCurrency(t.amount, currency)}
+                                </p>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            </div>
+
+            <div className="space-y-6">
+                <div ref={ref4} className={`bg-[var(--background-card)] backdrop-blur-sm p-6 rounded-xl shadow-lg border border-[var(--border-color)] invisible-for-animation ${isVisible4 ? 'animate-fadeInUp' : ''}`}>
+                    <h3 className="text-xl font-semibold mb-4">Expense by Category</h3>
+                    <ResponsiveContainer width="100%" height={250}>
+                        <PieChart>
+                            <Pie data={expenseData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={80} fill="#8884d8" labelLine={false} label={({ cx, cy, midAngle, innerRadius, outerRadius, percent }) => { const RADIAN = Math.PI / 180; const radius = innerRadius + (outerRadius - innerRadius) * 0.5; const x = cx + radius * Math.cos(-midAngle * RADIAN); const y = cy + radius * Math.sin(-midAngle * RADIAN); return ( <text x={x} y={y} fill="white" textAnchor={x > cx ? 'start' : 'end'} dominantBaseline="central" fontSize={12}> {`${(percent * 100).toFixed(0)}%`} </text> ); }} isAnimationActive={true} animationDuration={1000}>
+                                {expenseData.map((entry, index) => <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />)}
+                            </Pie>
+                            <Tooltip contentStyle={{ backgroundColor: 'var(--background-card)', border: '1px solid var(--border-color)' }} formatter={(value) => formatCurrency(value, currency)} />
+                            <Legend content={<CustomAnimatedLegend />} />
+                        </PieChart>
+                    </ResponsiveContainer>
+                </div>
+                <div ref={ref5} className={`bg-[var(--background-card)] backdrop-blur-sm p-6 rounded-xl shadow-lg border border-[var(--border-color)] invisible-for-animation ${isVisible5 ? 'animate-fadeInUp' : ''}`}>
+                    <h3 className="text-xl font-semibold mb-4">Financial Goals</h3>
+                    <div className="space-y-4">
+                        {goals.slice(0, 3).map(goal => {
+                            const progress = (goal.currentAmount / goal.targetAmount) * 100;
+                            return (
+                                <div key={goal.id}>
+                                    <div className="flex justify-between mb-1">
+                                        <span className="text-base font-medium text-[var(--text-primary)]">{goal.name}</span>
+                                        <span className="text-sm font-medium text-[var(--accent-color)]">{Math.round(progress)}%</span>
+                                    </div>
+                                    <div className="w-full bg-[var(--background-secondary)] rounded-full h-2.5">
+                                        <div className="bg-[var(--accent-color)] h-2.5 rounded-full transition-all duration-500" style={{ width: `${progress}%` }}></div>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+                 <AdvisorComponent financialSummary={financialSummary} budgets={budgets} currency={currency} />
+            </div>
+        </div>
+    );
+};
+
+const InfoCard = ({ title, amount, icon: Icon, color, currency, isVisible }) => {
+    const animatedAmount = useCountUpAnimation(isVisible ? Math.abs(amount) : 0, 1500);
+    const displayAmount = amount < 0 ? -animatedAmount : animatedAmount;
+
+    return (
+        <div className="bg-[var(--background-card)] backdrop-blur-sm p-6 rounded-xl shadow-lg border border-[var(--border-color)] flex items-center justify-between">
+            <div>
+                <p className="text-[var(--text-secondary)] text-sm">{title}</p>
+                <p className="text-2xl font-bold">{formatCurrency(displayAmount, currency)}</p>
+            </div>
+            <div className={`p-3 rounded-full bg-[var(--background-secondary)]`}>
+                <Icon className={`h-6 w-6 ${color}`} />
+            </div>
+        </div>
+    );
+};
+
+const AdvisorComponent = ({ financialSummary, budgets, currency }) => {
+    const [ref, isVisible] = useAnimateOnScroll({ threshold: 0.1 });
+    const [tips, setTips] = useState([]);
+    const [isLoading, setIsLoading] = useState(true);
+
+    useEffect(() => {
+        const generateTips = async () => {
+            if (!isVisible) return;
+
+            setIsLoading(true);
+            const lang = currency.lang || 'en-US';
+            const languageName = lang === 'ur-PK' ? 'Urdu-Hinglish' : lang === 'hi-IN' ? 'Hinglish' : 'English';
+            
+            const summary = `
+                - Total Income: ${financialSummary.income}
+                - Total Expense: ${financialSummary.expense}
+                - Balance: ${financialSummary.balance}
+                - Expenses by Category: ${JSON.stringify(financialSummary.expenseByCategory)}
+                - Budgets: ${JSON.stringify(budgets)}
+            `;
+
+            const prompt = `You are a friendly financial advisor. Based on the following financial summary, provide 2 short, actionable, and encouraging tips. Respond in the ${languageName} language. The user's currency is ${currency.code}.
+            Financial Summary: ${summary}
+            `;
+
+            const response = await callGeminiAPI(prompt, true);
+            
+            if (response) {
+                try {
+                    const parsedTips = JSON.parse(response);
+                    setTips(parsedTips);
+                } catch(e) {
+                    console.error("Failed to parse AI response:", e);
+                    setTips([{title: "Error", message: "Could not get advice from AI.", type: "warning"}]);
+                }
+            } else {
+                 setTips([{title: "Error", message: "Could not get advice from AI.", type: "warning"}]);
+            }
+            setIsLoading(false);
+        };
+
+        generateTips();
+    }, [isVisible, financialSummary, budgets, currency]);
+
+    const typeClasses = {
+        warning: "border-yellow-500 bg-yellow-500/10 text-yellow-200",
+        info: "border-blue-500 bg-blue-500/10 text-blue-200",
+        success: "border-green-500 bg-green-500/10 text-green-200",
+    }
+
+    return (
+        <div ref={ref} className={`bg-[var(--background-card)] backdrop-blur-sm p-6 rounded-xl shadow-lg border border-[var(--border-color)] invisible-for-animation ${isVisible ? 'animate-fadeInUp' : ''}`}>
+            <h3 className="text-xl font-semibold mb-4 flex items-center"><Sparkles className="mr-2 h-5 w-5 text-yellow-400"/> AI Advisor</h3>
+            <div className="space-y-3">
+                {isLoading ? (
+                    <>
+                        <div className="h-16 bg-[var(--background-secondary)] rounded-lg animate-pulse"></div>
+                        <div className="h-16 bg-[var(--background-secondary)] rounded-lg animate-pulse" style={{animationDelay: '0.1s'}}></div>
+                    </>
+                ) : (
+                    tips.map((tip, index) => (
+                        <div key={index} className={`p-3 rounded-lg border-l-4 ${typeClasses[tip.type]}`}>
+                            <p className="font-bold text-[var(--text-primary)]">{tip.title}</p>
+                            <p className="text-sm text-[var(--text-secondary)]">{tip.message}</p>
+                        </div>
+                    ))
+                )}
+            </div>
+        </div>
+    );
+};
+
+
+const TransactionsList = ({ transactions, openModal, handleDelete, currency }) => {
+    const sortedTransactions = useMemo(() => 
+        [...transactions].sort((a, b) => new Date(b.date) - new Date(a.date)),
+        [transactions]
+    );
+    const [ref, isVisible] = useAnimateOnScroll({ threshold: 0.1 });
+
+    return (
+        <div ref={ref} className={`bg-[var(--background-card)] backdrop-blur-sm p-4 sm:p-6 rounded-xl shadow-lg border border-[var(--border-color)] invisible-for-animation ${isVisible ? 'animate-fadeInUp' : ''}`}>
+            <h3 className="text-2xl font-bold mb-6">All Transactions</h3>
+            <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                    <thead>
+                        <tr className="border-b border-[var(--border-color)] text-[var(--text-secondary)]">
+                            <th className="p-3">Description</th>
+                            <th className="p-3">Amount</th>
+                            <th className="p-3 hidden sm:table-cell">Category</th>
+                            <th className="p-3 hidden md:table-cell">Date</th>
+                            <th className="p-3">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {sortedTransactions.map((t, index) => (
+                            <tr key={t.id} className="border-b border-[var(--border-color)] hover:bg-[var(--background-hover)]" style={{ animation: `fadeInUp 0.5s ease-out ${index * 0.05}s forwards`, opacity: 0 }}>
+                                <td className="p-3 font-medium">{t.description}</td>
+                                <td className={`p-3 font-semibold ${t.type === 'income' ? 'text-green-400' : 'text-red-400'}`}>
+                                    {t.type === 'income' ? '+' : '-'} {formatCurrency(t.amount, currency)}
+                                </td>
+                                <td className="p-3 hidden sm:table-cell">{t.category}</td>
+                                <td className="p-3 hidden md:table-cell">{new Date(t.date).toLocaleDateString()}</td>
+                                <td className="p-3">
+                                    <div className="flex items-center space-x-2">
+                                        <button onClick={() => openModal('transaction', t)} className="p-2 text-blue-400 hover:text-blue-300 transition-transform transform hover:scale-110"><Edit size={18} /></button>
+                                        <button onClick={() => handleDelete('transactions', t.id)} className="p-2 text-red-400 hover:text-red-300 transition-transform transform hover:scale-110"><Trash2 size={18} /></button>
+                                    </div>
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    );
+};
+
+const BudgetsList = ({ budgets, openModal, handleDelete, expenseByCategory, currency }) => {
+    const [ref, isVisible] = useAnimateOnScroll({ threshold: 0.1 });
+    return (
+    <div ref={ref} className={`bg-[var(--background-card)] backdrop-blur-sm p-6 rounded-xl shadow-lg border border-[var(--border-color)] invisible-for-animation ${isVisible ? 'animate-fadeInUp' : ''}`}>
+        <div className="flex justify-between items-center mb-6">
+            <h3 className="text-2xl font-bold">Your Budgets</h3>
+            <button onClick={() => openModal('budget')} className="bg-[var(--accent-color)] hover:bg-[var(--accent-color-hover)] text-white font-bold py-2 px-4 rounded-lg flex items-center transition-transform transform hover:scale-105">
+                <Plus className="h-5 w-5 mr-2" /> Add Budget
+            </button>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {budgets.map((budget, index) => {
+                const spent = expenseByCategory[budget.category] || 0;
+                const remaining = budget.limit - spent;
+                const progress = (spent / budget.limit) * 100;
+                return (
+                    <div key={budget.id} className="bg-[var(--background-secondary)] p-4 rounded-lg" style={{ animation: `fadeInUp 0.5s ease-out ${index * 0.1}s forwards`, opacity: 0 }}>
+                        <div className="flex justify-between items-start">
+                           <h4 className="text-lg font-semibold mb-2">{budget.category}</h4>
+                           <div className="flex items-center space-x-1">
+                                <button onClick={() => openModal('budget', budget)} className="p-1 text-blue-400 hover:text-blue-300"><Edit size={16} /></button>
+                                <button onClick={() => handleDelete('budgets', budget.id)} className="p-1 text-red-400 hover:text-red-300"><Trash2 size={16} /></button>
+                            </div>
+                        </div>
+                        <p className="text-sm text-[var(--text-secondary)]">Limit: {formatCurrency(budget.limit, currency)}</p>
+                        <p className="text-sm text-[var(--text-secondary)]">Spent: {formatCurrency(spent, currency)}</p>
+                        <div className="w-full bg-[var(--background-hover)] rounded-full h-2.5 my-3">
+                            <div className="bg-[var(--accent-color)] h-2.5 rounded-full transition-all duration-500" style={{ width: `${progress > 100 ? 100 : progress}%` }}></div>
+                        </div>
+                        <p className={`text-sm font-medium ${remaining >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {remaining >= 0 ? `Remaining: ${formatCurrency(remaining, currency)}` : `Overspent by: ${formatCurrency(Math.abs(remaining), currency)}`}
+                        </p>
+                    </div>
+                );
+            })}
+        </div>
+    </div>
+)};
+
+const GoalsList = ({ goals, openModal, handleDelete, currency }) => {
+    const [ref, isVisible] = useAnimateOnScroll({ threshold: 0.1 });
+    return (
+    <div ref={ref} className={`bg-[var(--background-card)] backdrop-blur-sm p-6 rounded-xl shadow-lg border border-[var(--border-color)] invisible-for-animation ${isVisible ? 'animate-fadeInUp' : ''}`}>
+        <div className="flex justify-between items-center mb-6">
+            <h3 className="text-2xl font-bold">Your Goals</h3>
+            <button onClick={() => openModal('goal')} className="bg-[var(--accent-color)] hover:bg-[var(--accent-color-hover)] text-white font-bold py-2 px-4 rounded-lg flex items-center transition-transform transform hover:scale-105">
+                <Plus className="h-5 w-5 mr-2" /> Add Goal
+            </button>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {goals.map((goal, index) => {
+                const progress = (goal.currentAmount / goal.targetAmount) * 100;
+                return (
+                     <div key={goal.id} className="bg-[var(--background-secondary)] p-4 rounded-lg" style={{ animation: `fadeInUp 0.5s ease-out ${index * 0.1}s forwards`, opacity: 0 }}>
+                        <div className="flex justify-between items-start">
+                           <h4 className="text-lg font-semibold mb-2">{goal.name}</h4>
+                            <div className="flex items-center space-x-1">
+                                <button onClick={() => openModal('goal', goal)} className="p-1 text-blue-400 hover:text-blue-300"><Edit size={16} /></button>
+                                <button onClick={() => handleDelete('goals', goal.id)} className="p-1 text-red-400 hover:text-red-300"><Trash2 size={16} /></button>
+                            </div>
+                        </div>
+                        <p className="text-sm text-[var(--text-secondary)]">Target: {formatCurrency(goal.targetAmount, currency)}</p>
+                        <p className="text-sm text-[var(--text-secondary)]">Saved: {formatCurrency(goal.currentAmount, currency)}</p>
+                        <div className="w-full bg-[var(--background-hover)] rounded-full h-2.5 my-3">
+                            <div className="bg-green-500 h-2.5 rounded-full transition-all duration-500" style={{ width: `${progress > 100 ? 100 : progress}%` }}></div>
+                        </div>
+                        <p className="text-sm font-medium text-[var(--text-primary)]">
+                           {Math.round(progress)}% Complete
+                        </p>
+                    </div>
+                );
+            })}
+        </div>
+    </div>
+)};
+
+
+const Modal = ({ modal, closeModal, handleAdd, handleUpdate, currency }) => {
+    const [formData, setFormData] = useState(modal.data || {});
+    const [isCategorizing, setIsCategorizing] = useState(false);
+
+    useEffect(() => {
+        if (modal.type === 'transaction' && !modal.data) {
+            setFormData({ type: 'expense', date: new Date().toISOString().split('T')[0] });
+        } else if (modal.data) {
+            setFormData(modal.data);
+        } else {
+            setFormData({});
+        }
+    }, [modal]);
+
+    const handleChange = (e) => {
+        const { name, value } = e.target;
+        setFormData(prev => ({ ...prev, [name]: value }));
+    };
+
+    const handleSmartCategory = async () => {
+        if (!formData.description) {
+            alert("Please enter a description first.");
+            return;
+        }
+        setIsCategorizing(true);
+        const prompt = `Based on the transaction description "${formData.description}", suggest a single, common financial category from this list: Food, Transport, Groceries, Bills, Entertainment, Shopping, Health, Salary, Other. Respond with only the category name.`;
+        const category = await callGeminiAPI(prompt);
+        if (category) {
+            setFormData(prev => ({ ...prev, category: category.trim() }));
+        }
+        setIsCategorizing(false);
+    };
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        const dataToSubmit = { ...formData };
+        ['amount', 'limit', 'targetAmount', 'currentAmount'].forEach(field => {
+            if (dataToSubmit[field]) {
+                dataToSubmit[field] = Number(dataToSubmit[field]);
+            }
+        });
+
+        if (modal.data) {
+            handleUpdate(modal.type + 's', modal.data.id, dataToSubmit);
+        } else {
+            handleAdd(modal.type + 's', dataToSubmit);
+        }
+    };
+
+    const renderForm = () => {
+        const inputClass = "w-full p-2 mb-4 bg-[var(--background-secondary)] rounded border border-[var(--border-color)] focus:ring-2 focus:ring-[var(--accent-color)] outline-none";
+        switch (modal.type) {
+            case 'transaction':
+                return (
+                    <>
+                        <div className="flex mb-4">
+                            <button type="button" onClick={() => handleChange({ target: { name: 'type', value: 'expense' } })} className={`flex-1 p-2 rounded-l-lg transition-colors ${formData.type === 'expense' ? 'bg-red-600 text-white' : 'bg-[var(--background-secondary)] hover:bg-[var(--background-hover)]'}`}>Expense</button>
+                            <button type="button" onClick={() => handleChange({ target: { name: 'type', value: 'income' } })} className={`flex-1 p-2 rounded-r-lg transition-colors ${formData.type === 'income' ? 'bg-green-600 text-white' : 'bg-[var(--background-secondary)] hover:bg-[var(--background-hover)]'}`}>Income</button>
+                        </div>
+                        <input name="amount" type="number" placeholder={`Amount in ${currency.code}`} value={formData.amount || ''} onChange={handleChange} className={inputClass} required />
+                        <input name="description" type="text" placeholder="Description" value={formData.description || ''} onChange={handleChange} className={inputClass} required />
+                        <div className="flex items-center gap-2 mb-4">
+                            <input name="category" type="text" placeholder="Category" value={formData.category || ''} onChange={handleChange} className={inputClass + " mb-0"} required />
+                            <button type="button" onClick={handleSmartCategory} disabled={isCategorizing} className="p-2 bg-yellow-500/20 text-yellow-400 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed">
+                                {isCategorizing ? <div className="w-5 h-5 border-2 border-yellow-400 border-t-transparent rounded-full animate-spin"></div> : <Sparkles size={20} />}
+                            </button>
+                        </div>
+                        <input name="date" type="date" value={formData.date || ''} onChange={handleChange} className={inputClass} required />
+                    </>
+                );
+            case 'budget':
+                return (
+                    <>
+                        <input name="category" type="text" placeholder="Category" value={formData.category || ''} onChange={handleChange} className={inputClass} required />
+                        <input name="limit" type="number" placeholder={`Limit in ${currency.code}`} value={formData.limit || ''} onChange={handleChange} className={inputClass} required />
+                    </>
+                );
+            case 'goal':
+                 return (
+                    <>
+                        <input name="name" type="text" placeholder="Goal Name" value={formData.name || ''} onChange={handleChange} className={inputClass} required />
+                        <input name="targetAmount" type="number" placeholder={`Target Amount in ${currency.code}`} value={formData.targetAmount || ''} onChange={handleChange} className={inputClass} required />
+                        <input name="currentAmount" type="number" placeholder={`Current Amount Saved in ${currency.code}`} value={formData.currentAmount || ''} onChange={handleChange} className={inputClass} required />
+                    </>
+                );
+            default: return null;
+        }
+    };
+    
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 animate-fadeInUp" style={{animationDuration: '0.3s'}}>
+            <div className="bg-[var(--background-card)] p-8 rounded-xl shadow-2xl w-full max-w-md m-4 animate-scaleIn border border-[var(--border-color)]">
+                <div className="flex justify-between items-center mb-6">
+                    <h3 className="text-2xl font-bold capitalize">{modal.data ? 'Edit' : 'Add'} {modal.type}</h3>
+                    <button onClick={closeModal} className="text-[var(--text-secondary)] hover:text-[var(--text-primary)]"><X size={24} /></button>
+                </div>
+                <form onSubmit={handleSubmit}>
+                    {renderForm()}
+                    <button type="submit" className="w-full bg-[var(--accent-color)] hover:bg-[var(--accent-color-hover)] text-white font-bold py-3 rounded-lg transition-transform transform hover:scale-105">{modal.data ? 'Update' : 'Add'}</button>
+                </form>
+            </div>
+        </div>
+    );
+};
